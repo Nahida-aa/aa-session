@@ -46,11 +46,11 @@ pub struct ClaudeSource {
 }
 
 impl ClaudeSource {
-    /// 从 `$HOME` 展开后的默认位置打开。
+    /// 从家目录展开后的默认位置打开。
     pub fn open_default() -> Result<Self> {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| Error::InvalidArgument("HOME is not set".into()))?;
+        let home = aa_session_core::home_dir().ok_or_else(|| {
+            Error::InvalidArgument("无法定位用户家目录（HOME / USERPROFILE 均未设置）".into())
+        })?;
         Self::open_dir(&home.join(DEFAULT_DATA_DIR))
     }
 

@@ -1,6 +1,6 @@
 # aa-session
 
-列出并导出本地 agent 会话（opencode / codebuddy / claude / zed），导成**可以直接在编辑器里全文搜索**的 JSON 或 Markdown。
+列出并导出本地 agent 会话（opencode / codebuddy / codebuddy-ide / claude / zed），导成**可以直接在编辑器里全文搜索**的 JSON 或 Markdown。
 
 ## 为什么做这个
 
@@ -64,6 +64,7 @@ zed exports/LocalDub/opencode
 | --- | --- | --- | --- |
 | `opencode` | `~/.local/share/opencode/opencode.db`（SQLite，约 6 GB） | ✅ | `rename-project` |
 | `codebuddy` | `~/.codebuddy/projects/<编码路径>/*.jsonl` | ✅ | ❌ |
+| `codebuddy-ide` | `%LOCALAPPDATA%\CodeBuddyExtension\Data\<窗口>\CodeBuddyIDE\...`（三层 JSON 树） | ✅ | ❌ |
 | `claude` | `~/.claude/projects/<编码路径>/<uuid>.jsonl` | ✅ | ❌ |
 | `zed` | `~/.local/share/zed/threads/threads.db`（zstd 压缩 blob） | ✅ | `import`（覆盖导入） |
 
@@ -188,6 +189,7 @@ just ci                           # fmt + clippy + test，提交前跑这个
 packages/core/                领域模型 + SessionSource trait（零外部依赖）
 packages/sources/opencode/    直读 opencode.db（rusqlite）
 packages/sources/codebuddy/   直读 ~/.codebuddy/projects/**/*.jsonl
+packages/sources/codebuddy-ide/ 直读 CodeBuddy IDE 的 history/**/index.json + messages/*.json
 packages/sources/zed/         直读 threads.db + 覆盖导入
 packages/apps/cli/            clap 入口
 ```

@@ -47,11 +47,11 @@ pub struct ZedSource {
 }
 
 impl ZedSource {
-    /// 从 `$HOME` 展开后的默认位置打开。
+    /// 从家目录展开后的默认位置打开。
     pub fn open_default() -> Result<Self> {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| Error::InvalidArgument("HOME is not set".into()))?;
+        let home = aa_session_core::home_dir().ok_or_else(|| {
+            Error::InvalidArgument("无法定位用户家目录（HOME / USERPROFILE 均未设置）".into())
+        })?;
         Self::open(&home.join(DEFAULT_DATA_DIR).join(DB_FILE_NAME))
     }
 
@@ -82,16 +82,13 @@ impl ZedSource {
             });
         }
 
-        let (uri, flags) = if writable {
-            (
-                format!("file:{}", path.display()),
-                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
-            )
+        // URI 的拼装交给 core：Windows 上 `canonicalize()` 给的 `\\?\C:\...`
+        // 不能直接进 `file:` URI。
+        let uri = aa_session_core::sqlite_file_uri(&path, !writable);
+        let flags = if writable {
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI
         } else {
-            (
-                format!("file:{}?mode=ro", path.display()),
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-            )
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI
         };
         let conn = Connection::open_with_flags(&uri, flags).map_err(|e| Error::Open {
             path: path.display().to_string(),

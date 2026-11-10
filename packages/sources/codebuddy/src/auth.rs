@@ -28,11 +28,9 @@ pub const AUTH_DIR: &[&str] = &[
     "auth",
 ];
 
-/// 凭据目录默认位置（`$HOME` 展开后）。
+/// 凭据目录默认位置（家目录展开后）。
 pub fn auth_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let home = aa_session_core::home_dir().unwrap_or_default();
     let mut p = home;
     for seg in AUTH_DIR {
         p.push(seg);

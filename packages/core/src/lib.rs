@@ -12,11 +12,13 @@
 //! 「从 app A 的会话 fork 出 app A 的新会话」用的是同一个字段。
 
 pub mod error;
+pub mod home;
 pub mod markdown;
 pub mod model;
 pub mod source;
 
 pub use error::{Error, Result};
+pub use home::{home_dir, long_path, sqlite_file_uri};
 pub use model::{DirectoryMeta, ProjectMeta, SessionMeta, UNKNOWN_PROJECT_PATH};
 pub use source::{
     Archived, EmptySessions, ImportReport, NO_LIMIT, ProjectSelector, SessionFilter,

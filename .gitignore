@@ -8,3 +8,5 @@ target/
 # 导出的会话 JSON（单个可达数百 MB，不入库）
 exports/
 01a*.json
+# `show` 默认输出到当前目录的测试残留
+chat.json

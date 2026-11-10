@@ -2,9 +2,18 @@
 //!
 //! 目标库：`~/.local/share/opencode/opencode.db`（SQLite/WAL，约 6 GB）。
 //!
-//! 读 `session_v2` / `session_message` / `project`（v2 schema）。v1 的
-//! `session` / `message` / `part` 三表**不读** —— 同一库里两套都在，但 v2
-//! 才是当前 schema。
+//! 读 `session_v2` / `session_message` / `project`（v2 schema），v1 的
+//! `session` / `message` / `part` 作为历史数据补充。
+//!
+//! # 两套 schema
+//!
+//! 打开时探测 `session_v2` 是否存在：
+//!
+//! - **存在**（当前 opencode）：以 v2 为准，v1 里未被迁走的旧会话用
+//!   `NOT IN (SELECT id FROM session_v2)` 补进结果；
+//! - **不存在**（老版本、以及实测的 Windows 构建）：整库只有 v1，所有查询
+//!   切到 `session` / `message` / `part`，**一个 `session_v2` 都不能引用**，
+//!   否则直接报 `no such table: session_v2`。
 //!
 //! # 为什么直读而不是走 HTTP API
 //!
@@ -74,6 +83,13 @@ pub struct OpencodeSource {
     conn: Connection,
     /// 打开时解析出的绝对路径，仅用于错误信息。
     path: PathBuf,
+    /// 库里是否存在 v2 的 `session_v2` 表。
+    ///
+    /// 老版本 opencode 只写 v1 的 `session` / `message` / `part`，v2 表根本
+    /// 不存在（实测 Windows 上的库就是这样）。所有查询都按这个开关在 v1 / v2
+    /// 之间**二选一**，不能假设两套表并存——那会直接报
+    /// `no such table: session_v2`。
+    has_v2: bool,
 }
 
 impl OpencodeSource {
@@ -82,11 +98,11 @@ impl OpencodeSource {
         Self::open(&dir.join(DB_FILE_NAME))
     }
 
-    /// 从 `$HOME` 展开后的默认位置打开。
+    /// 从家目录展开后的默认位置打开。
     pub fn open_default() -> Result<Self> {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| Error::InvalidArgument("HOME is not set".into()))?;
+        let home = aa_session_core::home_dir().ok_or_else(|| {
+            Error::InvalidArgument("无法定位用户家目录（HOME / USERPROFILE 均未设置）".into())
+        })?;
         Self::open_dir(&home.join(DEFAULT_DATA_DIR))
     }
 
@@ -114,16 +130,13 @@ impl OpencodeSource {
 
         // `mode=ro` 从 SQLite 层保证只读，比打开后再靠代码自律可靠。
         // 写路径用普通 RW 连接，并交给 SQLite 自己管 WAL。
-        let (uri, flags) = if writable {
-            (
-                format!("file:{}", path.display()),
-                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
-            )
+        // URI 的拼装交给 core：Windows 上 `canonicalize()` 给的 `\\?\C:\...`
+        // 不能直接进 `file:` URI。
+        let uri = aa_session_core::sqlite_file_uri(&path, !writable);
+        let flags = if writable {
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI
         } else {
-            (
-                format!("file:{}?mode=ro", path.display()),
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-            )
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI
         };
         let conn = Connection::open_with_flags(&uri, flags).map_err(|e| Error::Open {
             path: path.display().to_string(),
@@ -134,7 +147,10 @@ impl OpencodeSource {
         let _ = conn.pragma_update(None, "mmap_size", 1_073_741_824); // 1 GiB
         let _ = conn.pragma_update(None, "cache_size", -65_536); // 64 MiB
 
-        Ok(Self { conn, path })
+        // schema 探测只做一次：v1-only 的库每次查询都会撞 `session_v2` 不存在。
+        let has_v2 = table_exists(&conn, "session_v2");
+
+        Ok(Self { conn, path, has_v2 })
     }
 
     /// 数据库文件路径。
@@ -243,20 +259,104 @@ impl OpencodeSource {
     /// 按 schema 分支构造 WHERE 子句。
     ///
     /// v1 分支额外带上「排除已在 v2 里出现的会话」，保证 UNION ALL 之后
-    /// 没有重复。
+    /// 没有重复。v1-only 的库不存在 `session_v2`，这一步整个跳过。
     fn build_where_with(&self, filter: &SessionFilter, is_v1: bool) -> Result<BuildWhereResult> {
-        let mut result = build_where(filter);
+        let mut result = build_where(filter, self.has_v2);
         if is_v1 {
             // v1 分支：空壳判定改走 `message` 表（v2 的 `session_message` 对
             // 早期会话没用，那批会话的消息全在 v1 的 `message` 里）。
             result.sql = result
                 .sql
                 .replace(filter.empty.sql_filter(), filter.empty.sql_filter_v1());
-            result
-                .sql
-                .push_str(" AND s.id NOT IN (SELECT id FROM session_v2)");
+            if self.has_v2 {
+                result
+                    .sql
+                    .push_str(" AND s.id NOT IN (SELECT id FROM session_v2)");
+            }
         }
         Ok(result)
+    }
+
+    /// `projects()` 用的计数 SQL。
+    ///
+    /// v1-only 的库没有 `session_v2`：v2 的三个计数列退回常量 0，v1 的计数
+    /// 去掉「排除已在 v2 出现」的条件。**列序保持不变**，行映射不用改。
+    fn projects_sql(&self) -> String {
+        let (v2_top, v2_sub, v2_arch) = if self.has_v2 {
+            (
+                "(SELECT count(*) FROM session_v2 s \
+                   WHERE s.project_id = p.id AND s.parent_id IS NULL \
+                     AND s.time_archived IS NULL \
+                     AND EXISTS (SELECT 1 FROM session_message m WHERE m.session_id = s.id))",
+                "(SELECT count(*) FROM session_v2 s \
+                   WHERE s.project_id = p.id AND s.parent_id IS NOT NULL \
+                     AND s.time_archived IS NULL)",
+                "(SELECT count(*) FROM session_v2 s \
+                   WHERE s.project_id = p.id AND s.time_archived IS NOT NULL)",
+            )
+        } else {
+            ("0", "0", "0")
+        };
+        let v1_not_in_v2 = if self.has_v2 {
+            " AND s.id NOT IN (SELECT id FROM session_v2)"
+        } else {
+            ""
+        };
+        // v1 的 `project` 表没有 `time_active` 列（实测本机就是如此），
+        // 用 `time_updated` 作为最近活跃时间的等价替代。
+        let time_active = if self.has_v2 {
+            "p.time_active"
+        } else {
+            "p.time_updated"
+        };
+        format!(
+            "SELECT p.id, COALESCE(p.worktree, ''), p.vcs, \
+             {v2_top}, \
+             (SELECT count(*) FROM session s \
+                WHERE s.project_id = p.id AND s.parent_id IS NULL \
+                  AND s.time_archived IS NULL{v1_not_in_v2} \
+                  AND EXISTS (SELECT 1 FROM message m WHERE m.session_id = s.id)), \
+             {v2_sub}, {v2_arch}, \
+             (SELECT count(*) FROM session s \
+                WHERE s.project_id = p.id AND s.time_archived IS NOT NULL{v1_not_in_v2}), \
+             {time_active} \
+             FROM project p \
+             ORDER BY {time_active} DESC, p.id ASC"
+        )
+    }
+
+    /// `directories()` 用的聚合 SQL。
+    ///
+    /// v1-only 的库没有 `session_v2`：UNION 的 v2 那一支整段去掉，
+    /// v1 那一支去掉「排除已在 v2 出现」的条件。
+    fn directories_sql(&self) -> String {
+        let v2_branch = if self.has_v2 {
+            "SELECT s.directory AS dir, s.project_id, 1 AS n, s.time_updated AS updated \
+             FROM session_v2 s \
+             WHERE s.parent_id IS NULL \
+               AND s.time_archived IS NULL \
+               AND EXISTS (SELECT 1 FROM session_message m WHERE m.session_id = s.id) \
+             UNION ALL "
+        } else {
+            ""
+        };
+        let v1_not_in_v2 = if self.has_v2 {
+            " AND s.id NOT IN (SELECT id FROM session_v2)"
+        } else {
+            ""
+        };
+        format!(
+            "SELECT d.dir AS directory, sum(d.n) AS n, max(d.updated) AS updated, \
+                    count(DISTINCT d.project_id) AS projects \
+             FROM ( {v2_branch}\
+                   SELECT s.directory AS dir, s.project_id, 1 AS n, s.time_updated AS updated \
+                   FROM session s \
+                   WHERE s.parent_id IS NULL \
+                     AND s.time_archived IS NULL{v1_not_in_v2} \
+                     AND EXISTS (SELECT 1 FROM message m WHERE m.session_id = s.id) \
+             ) d \
+             GROUP BY d.dir ORDER BY updated DESC"
+        )
     }
 
     /// 按 `worktree` 全等找出 project id；同路径的多个 id 全部返回。
@@ -295,6 +395,20 @@ impl OpencodeSource {
 /// 把 `rusqlite` 错误转成领域错误。
 fn query_err(e: rusqlite::Error) -> Error {
     Error::Query(e.to_string())
+}
+
+/// 库里是否存在该表。
+///
+/// v1-only 的库连 `session_v2` 这个名字都不存在，所有 SQL 必须先问这里，
+/// 不能靠「先跑一查，报错了再兜底」——错误信息会混进正常流程。
+pub(crate) fn table_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        params![name],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
 }
 
 /// 把一行会话记录读成 [`SessionMeta`]。
@@ -355,7 +469,11 @@ struct BuildWhereResult {
 }
 
 /// 按过滤条件拼 `WHERE` 子句与绑定值。
-fn build_where(filter: &SessionFilter) -> BuildWhereResult {
+///
+/// `has_v2` 决定空壳判定要不要带上 v2 的 `session_message` 那一半：
+/// v1-only 的库里 `session_message` 可能整表为空（甚至不存在），照抄 v2 条件
+/// 会把所有会话都判成空壳、一条都不剩。
+fn build_where(filter: &SessionFilter, has_v2: bool) -> BuildWhereResult {
     let mut sql = String::from(" WHERE 1 = 1");
     let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
@@ -380,8 +498,10 @@ fn build_where(filter: &SessionFilter) -> BuildWhereResult {
     // 归档会话默认排除 —— 见 `Archived` 的文档。
     sql.push_str(filter.archived.sql_filter());
     // 空壳会话（0 消息）默认排除 —— 见 `EmptySessions` 的文档。
-    // v2 用 session_message，v1 用 message，两表各判一次。
-    sql.push_str(filter.empty.sql_filter());
+    // v2 用 session_message、v1 用 message，两表各判一次；v1-only 的库只判 v1。
+    if has_v2 {
+        sql.push_str(filter.empty.sql_filter());
+    }
     sql.push_str(filter.empty.sql_filter_v1());
 
     // 项目过滤走 project 表的 worktree，不能直接拿 s.project_id —— 因为
@@ -453,29 +573,12 @@ impl SessionSource for OpencodeSource {
     fn projects(&self) -> Result<Vec<ProjectMeta>> {
         // 会话数对齐 `sessions` 的默认口径（顶层 + 未归档 + 非空壳），
         // 且 v1/v2 都算——去重用「id 不在 session_v2」把重叠的 v1 行排除。
-        let sql = "SELECT p.id, COALESCE(p.worktree, ''), p.vcs,
-                          (SELECT count(*) FROM session_v2 s
-                            WHERE s.project_id = p.id AND s.parent_id IS NULL
-                              AND s.time_archived IS NULL
-                              AND EXISTS (SELECT 1 FROM session_message m WHERE m.session_id = s.id)),
-                          (SELECT count(*) FROM session s
-                            WHERE s.project_id = p.id AND s.parent_id IS NULL
-                              AND s.time_archived IS NULL
-                              AND s.id NOT IN (SELECT id FROM session_v2)
-                              AND EXISTS (SELECT 1 FROM message m WHERE m.session_id = s.id)),
-                          (SELECT count(*) FROM session_v2 s
-                            WHERE s.project_id = p.id AND s.parent_id IS NOT NULL
-                              AND s.time_archived IS NULL),
-                          (SELECT count(*) FROM session_v2 s
-                            WHERE s.project_id = p.id AND s.time_archived IS NOT NULL),
-                          (SELECT count(*) FROM session s
-                            WHERE s.project_id = p.id AND s.time_archived IS NOT NULL
-                              AND s.id NOT IN (SELECT id FROM session_v2)),
-                          p.time_active
-                   FROM project p
-                   ORDER BY p.time_active DESC, p.id ASC";
+        //
+        // v1-only 的库没有 `session_v2`：三个 v2 子查询全部换成常量 0，
+        // 列序不变，下面的行映射不用动。
+        let sql = self.projects_sql();
 
-        self.collect_rows(sql, &[], |row| {
+        self.collect_rows(&sql, &[], |row| {
             let get = |i: usize| -> Result<i64> { row.get(i).map_err(query_err) };
             Ok(ProjectMeta {
                 app: APP_NAME.to_string(),
@@ -499,34 +602,10 @@ impl SessionSource for OpencodeSource {
     fn directories(&self) -> Result<Vec<DirectoryMeta>> {
         // 与 `sessions` 同口径：顶层 + 未归档 + 非空壳，v1/v2 都算。
         // UNION ALL 后按目录聚合，`project_count` 用 DISTINCT 跨两表计数。
-        let sql = "SELECT d.dir AS directory,
-                          sum(d.n) AS n,
-                          max(d.updated) AS updated,
-                          count(DISTINCT d.project_id) AS projects
-                   FROM (
-                       SELECT s.directory AS dir,
-                              s.project_id,
-                              1 AS n,
-                              s.time_updated AS updated
-                       FROM session_v2 s
-                       WHERE s.parent_id IS NULL
-                         AND s.time_archived IS NULL
-                         AND EXISTS (SELECT 1 FROM session_message m WHERE m.session_id = s.id)
-                       UNION ALL
-                       SELECT s.directory,
-                              s.project_id,
-                              1,
-                              s.time_updated
-                       FROM session s
-                       WHERE s.parent_id IS NULL
-                         AND s.time_archived IS NULL
-                         AND s.id NOT IN (SELECT id FROM session_v2)
-                         AND EXISTS (SELECT 1 FROM message m WHERE m.session_id = s.id)
-                   ) d
-                   GROUP BY d.dir
-                   ORDER BY updated DESC";
+        // v1-only 的库由 `directories_sql()` 去掉 v2 那一支。
+        let sql = self.directories_sql();
 
-        self.collect_rows(sql, &[], |row| {
+        self.collect_rows(&sql, &[], |row| {
             let path: String = row.get(0).map_err(query_err)?;
             Ok(DirectoryMeta {
                 // directory 理论上非空，但历史数据里见过空串，别让它显示成空行。
@@ -556,45 +635,62 @@ impl SessionSource for OpencodeSource {
     fn sessions(&self, filter: &SessionFilter, sort: SortKey) -> Result<Vec<SessionMeta>> {
         // 同 id 在 v1 和 v2 都有时以 v2 为准（v1 分支用 NOT IN 排除），
         // 避免同一条会话在结果里出现两次。
-        let v2_where = self.build_where_with(filter, false)?;
-        let v1_where = self.build_where_with(filter, true)?;
+        //
+        // v1-only 的库没有 `session_v2`：直接只查 v1，不拼 v2 那一支，
+        // 否则 SQL 一执行就报 `no such table: session_v2`。
+        let (sql, mut binds) = if self.has_v2 {
+            let v2_where = self.build_where_with(filter, false)?;
+            let v1_where = self.build_where_with(filter, true)?;
 
-        let v2_sql = format!(
-            "SELECT {SESSION_COLUMNS} {SESSION_FROM_PROJECT}{}",
-            v2_where.sql
-        );
-        // 同一套列序 + WHERE 片段（`s.` 前缀在两张表都成立），
-        // v1 分支只需换来源表。
-        let v1_sql = format!(
-            "SELECT {SESSION_COLUMNS_V1} {SESSION_FROM_PROJECT_V1}{}",
-            v1_where.sql
-        );
+            let v2_sql = format!(
+                "SELECT {SESSION_COLUMNS} {SESSION_FROM_PROJECT}{}",
+                v2_where.sql
+            );
+            // 同一套列序 + WHERE 片段（`s.` 前缀在两张表都成立），
+            // v1 分支只需换来源表。
+            let v1_sql = format!(
+                "SELECT {SESSION_COLUMNS_V1} {SESSION_FROM_PROJECT_V1}{}",
+                v1_where.sql
+            );
 
-        let sql = format!(
-            "{v2_sql} \
-             UNION ALL \
-             {v1_sql} \
-             ORDER BY {} LIMIT ?",
-            order_by(sort)
-        );
+            let sql = format!(
+                "{v2_sql} \
+                 UNION ALL \
+                 {v1_sql} \
+                 ORDER BY {} LIMIT ?",
+                order_by(sort)
+            );
+            let mut all: Vec<Box<dyn rusqlite::ToSql>> = v2_where.binds;
+            all.extend(v1_where.binds);
+            (sql, all)
+        } else {
+            let v1_where = self.build_where_with(filter, true)?;
+            let sql = format!(
+                "SELECT {SESSION_COLUMNS_V1} {SESSION_FROM_PROJECT_V1}{} \
+                 ORDER BY {} LIMIT ?",
+                v1_where.sql,
+                order_by(sort)
+            );
+            (sql, v1_where.binds)
+        };
 
-        let mut all: Vec<Box<dyn rusqlite::ToSql>> = v2_where.binds;
-        all.extend(v1_where.binds);
-        all.push(Box::new(filter.limit as i64));
-        let refs: Vec<&dyn rusqlite::ToSql> = all.iter().map(|b| b.as_ref()).collect();
+        binds.push(Box::new(filter.limit as i64));
+        let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
 
         self.collect_rows(&sql, &refs, session_from_row)
     }
 
     fn session(&self, session_id: &str) -> Result<Option<SessionMeta>> {
         // 先查 v2，查不到再查 v1 —— 同 id 的两份记录以 v2 为准。
-        let v2 = format!("SELECT {SESSION_COLUMNS} {SESSION_FROM_PROJECT} WHERE s.id = ?1");
-        if let Some(meta) = self
-            .collect_rows(&v2, &[&session_id], session_from_row)?
-            .into_iter()
-            .next()
-        {
-            return Ok(Some(meta));
+        if self.has_v2 {
+            let v2 = format!("SELECT {SESSION_COLUMNS} {SESSION_FROM_PROJECT} WHERE s.id = ?1");
+            if let Some(meta) = self
+                .collect_rows(&v2, &[&session_id], session_from_row)?
+                .into_iter()
+                .next()
+            {
+                return Ok(Some(meta));
+            }
         }
 
         let v1 = format!("SELECT {SESSION_COLUMNS_V1} {SESSION_FROM_PROJECT_V1} WHERE s.id = ?1");
@@ -612,21 +708,33 @@ impl SessionSource for OpencodeSource {
     /// 返回的 JSON 对象含 `session` / `session_message` / `message` / `part` 四个字段。
     fn dump(&self, session_id: &str) -> Result<serde_json::Value> {
         // 会话行：v2 优先，查不到回落到 v1 `session` 表。
-        let session = self
-            .dump_rows_by_sql("SELECT * FROM session_v2 WHERE id = ?1", session_id)?
-            .into_iter()
-            .next()
-            .or_else(|| {
-                self.dump_rows_by_sql("SELECT * FROM session WHERE id = ?1", session_id)
-                    .ok()
-                    .and_then(|rows| rows.into_iter().next())
-            })
-            .ok_or_else(|| Error::NotFound(format!("session {session_id}")))?;
+        // v1-only 的库没有 `session_v2`，直接读 v1。
+        let session = if self.has_v2 {
+            self.dump_rows_by_sql("SELECT * FROM session_v2 WHERE id = ?1", session_id)?
+                .into_iter()
+                .next()
+                .or_else(|| {
+                    self.dump_rows_by_sql("SELECT * FROM session WHERE id = ?1", session_id)
+                        .ok()
+                        .and_then(|rows| rows.into_iter().next())
+                })
+        } else {
+            self.dump_rows_by_sql("SELECT * FROM session WHERE id = ?1", session_id)?
+                .into_iter()
+                .next()
+        }
+        .ok_or_else(|| Error::NotFound(format!("session {session_id}")))?;
 
-        let session_messages = self.dump_rows_by_sql(
-            "SELECT * FROM session_message WHERE session_id = ?1 ORDER BY seq ASC",
-            session_id,
-        )?;
+        // v1-only 的库没有 v2 的 `session_message`，这一路留空数组；
+        // `markdown::from_dump` 见到空就自动改用 v1 的 `message`。
+        let session_messages = if self.has_v2 {
+            self.dump_rows_by_sql(
+                "SELECT * FROM session_message WHERE session_id = ?1 ORDER BY seq ASC",
+                session_id,
+            )?
+        } else {
+            Vec::new()
+        };
         let v1_messages = self.dump_rows_by_sql(
             "SELECT * FROM message WHERE session_id = ?1 \
              ORDER BY time_created ASC, id ASC",
@@ -734,6 +842,45 @@ fn expiry_status(expires_ms: i64) -> serde_json::Value {
         "expires_at": expires_ms,
         "days_left": days_left,
     })
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    fn source(has_v2: bool) -> OpencodeSource {
+        OpencodeSource {
+            conn: Connection::open_in_memory().expect("内存库"),
+            path: PathBuf::new(),
+            has_v2,
+        }
+    }
+
+    #[test]
+    fn v1_only_sql_never_mentions_session_v2() {
+        // v1-only 的库里 `session_v2` 不存在，任何一句提到它的 SQL 都会
+        // 直接把 `projects` / `directories` 打挂。
+        let v1 = source(false);
+        assert!(!v1.projects_sql().contains("session_v2"));
+        assert!(!v1.directories_sql().contains("session_v2"));
+    }
+
+    #[test]
+    fn v2_sql_keeps_dedup_against_v1() {
+        let v2 = source(true);
+        assert!(v2.projects_sql().contains("session_v2"));
+        assert!(v2.directories_sql().contains("session_v2"));
+    }
+
+    #[test]
+    fn table_exists_detects_only_real_tables() {
+        let src = source(false);
+        src.conn
+            .execute_batch("CREATE TABLE session (id TEXT)")
+            .expect("建表");
+        assert!(table_exists(&src.conn, "session"));
+        assert!(!table_exists(&src.conn, "session_v2"));
+    }
 }
 
 #[cfg(test)]

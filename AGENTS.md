@@ -132,25 +132,31 @@ opencode 把主 agent 派出的探查任务记成独立会话（`parent_id` 非�
 
 ## 数据源
 
-四个 app，各自直读自己的存储，互不共享代码：
+五个 app，各自直读自己的存储，互不共享代码：
 
 | `--app` | 存储 | 形态 |
 | --- | --- | --- |
 | `opencode` | `~/.local/share/opencode/opencode.db`（约 6 GB） | SQLite |
 | `codebuddy` | `~/.codebuddy/projects/<编码路径>/*.jsonl` | 每会话一个 JSONL 事件流 |
+| `codebuddy-ide` | `%LOCALAPPDATA%\CodeBuddyExtension\Data\<窗口>\CodeBuddyIDE\<引用>\history\<md5>\` | 工作区 / 会话 / 消息三层 JSON 文件 |
 | `claude` | `~/.claude/projects/<编码路径>/<uuid>.jsonl` | 每会话一个 JSONL 事件流（同一条消息会拆成多行） |
 | `zed` | `~/.local/share/zed/threads/threads.db` | SQLite（zstd 压缩的 `thread_json` blob） |
 
 opencode 的读取细则：
 
-- **会话元数据列表是 v1 + v2 合并读**：`sessions()` / `session()` / `projects()`
-  都从 `session_v2`（+ `session_message` / `project`）和 v1 的
-  `session` / `message` / `part` 两张表 `UNION ALL`，v1 分支用
-  `s.id NOT IN (SELECT id FROM session_v2)` 去重（同 id 以 v2 为准）。见
-  `packages/sources/opencode/src/lib.rs` 的 `SESSION_FROM_PROJECT_V1` 与 `sessions()`。
+- 打开时探测 `session_v2` 是否存在，决定整库走哪套 schema：
+  - 有 → **会话元数据列表是 v1 + v2 合并读**：`sessions()` / `session()` /
+    `projects()` 都从 `session_v2`（+ `session_message` / `project`）和 v1 的
+    `session` / `message` / `part` 两张表 `UNION ALL`，v1 分支用
+    `s.id NOT IN (SELECT id FROM session_v2)` 去重（同 id 以 v2 为准）。见
+    `packages/sources/opencode/src/lib.rs` 的 `SESSION_FROM_PROJECT_V1` 与 `sessions()`；
+  - 没有（老版本、以及 Windows 构建）→ 只读 v1（`session` / `message` / `part`），
+    **任何一句 SQL 都不能提 `session_v2`**，否则直接报 `no such table`。
 - dump / Markdown 渲染层相反：同一会话两表都有残留行时**只读 v2**
   （`session_message` 非空即视为 v2），否则对话会打印两遍。见
   [`.agents/export-format.md`](.agents/export-format.md)。
+- v1 的 `project` 表没有 `time_active` 列（实测本机就是如此），用 `time_updated`
+  作为最近活跃时间的等价替代。
 - 以 SQLite `mode=ro` 打开，**永不写入**。
 
 > 这是 **v2 刚发布约一个月（2026-10 前后）的过渡期状态**，不是长期设计。
@@ -165,11 +171,16 @@ codebuddy 有**自动清除**机制（`cleanupPeriodDays`，默认 30 天，本�
 [`docs/codebuddy-retention.md`](docs/codebuddy-retention.md)。要长期归档必须导出，
 别指望源目录自己留着。
 
+codebuddy-ide 的 `history/<md5>` 目录名是**工作区路径的 md5（大小写敏感、反斜杠）**，
+反查优先用 `genie-history` 的 base64 目录名，其次工作区引用目录名，最后从会话里的
+`<user_info> Workspace Folder:` 兜底。消息文件路径常常超过 `MAX_PATH`，所有 I/O 必须
+经 `core::long_path()` 加 `\\?\` 前缀。
+
 claude 的 `assistant` 事件**不是一条消息**：同一条 API 消息的每个内容块各占一行，
 靠 `message.id` 相同来标识；`usage` 在这几行上完全重复，统计 token 必须按
 `message.id` 去重（按行累加会翻 N 倍）。元数据统计已处理，Markdown 归并尚未实现。
 
-zed 是唯一实现了**写入**（`SessionImporter` 覆盖导入）的来源；另外三个
+zed 是唯一实现了**写入**（`SessionImporter` 覆盖导入）的来源；另外四个
 `open_importer()` 返回 `None`。
 
 ### 为什么直读而不是 `opencode serve` HTTP API
@@ -184,7 +195,7 @@ opencode 提供 `opencode serve`（`GET /session` 等）。不用它：
 ### 关于 `app`
 
 `SessionSource::app()` 标识数据由哪个 agent 应用产生（当前实现：
-`opencode` / `codebuddy` / `claude` / `zed`）。它**同时是「来源」和「目标」**——将来 fork 时
+`opencode` / `codebuddy` / `codebuddy-ide` / `claude` / `zed`）。它**同时是「来源」和「目标」**——将来 fork 时
 「从 app A 的会话 fork 出 app A 的新会话」用的是同一个字段。不要叫 `source`，那会被误解成只读导入方向。
 
 ## 架构
@@ -193,6 +204,7 @@ opencode 提供 `opencode serve`（`GET /session` 等）。不用它：
 core/                领域模型 + SessionSource trait（零外部依赖）
 sources/opencode/    直读 opencode.db（rusqlite）
 sources/codebuddy/   直读 ~/.codebuddy/projects/**/*.jsonl
+sources/codebuddy-ide/ 直读 CodeBuddy IDE 的 history/**/index.json + messages/*.json
 sources/claude/      直读 ~/.claude/projects/**/*.jsonl
 sources/zed/         直读 threads.db + 覆盖导入（唯一写路径）
 apps/cli/            clap 入口

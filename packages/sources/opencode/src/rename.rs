@@ -77,18 +77,28 @@ pub fn plan(conn: &Connection, old_path: &str, new_path: &str) -> Result<RenameP
         "SELECT count(*) FROM project WHERE worktree LIKE ? ESCAPE '\\'",
         &needle_refs,
     )?;
-    let session_v2_rows = count(
-        "SELECT count(*) FROM session_v2 WHERE directory LIKE ? ESCAPE '\\'",
-        &needle_refs,
-    )?;
+    // v1-only 的库没有 `session_v2`：相关计数按 0 处理，不执行查询。
+    let has_v2 = crate::table_exists(conn, "session_v2");
+    let session_v2_rows = if has_v2 {
+        count(
+            "SELECT count(*) FROM session_v2 WHERE directory LIKE ? ESCAPE '\\'",
+            &needle_refs,
+        )?
+    } else {
+        0
+    };
     let session_rows = count(
         "SELECT count(*) FROM session WHERE directory LIKE ? ESCAPE '\\'",
         &needle_refs,
     )?;
-    let already_current = count(
-        "SELECT count(*) FROM session_v2 WHERE directory = ?",
-        &refs(&[new_path.to_string()]),
-    )?;
+    let already_current = if has_v2 {
+        count(
+            "SELECT count(*) FROM session_v2 WHERE directory = ?",
+            &refs(&[new_path.to_string()]),
+        )?
+    } else {
+        0
+    };
 
     Ok(RenamePlan {
         project_rows,
@@ -128,6 +138,10 @@ pub fn apply(conn: &mut Connection, old_path: &str, new_path: &str) -> Result<Re
     let (sd, sdb) = under_prefix("directory", old_path);
     let tail = format!("substr(directory, {})", old_path.len() + 1);
     for table in ["session_v2", "session"] {
+        // v1-only 的库里 `session_v2` 不存在，跳过即可，别让整条改名失败。
+        if !crate::table_exists(&tx, table) {
+            continue;
+        }
         tx.execute(
             &format!("UPDATE {table} SET directory = ?1 || {tail} WHERE {sd}"),
             rusqlite::params_from_iter(

@@ -4,6 +4,7 @@ members = [
     "packages/core",
     "packages/sources/claude",
     "packages/sources/codebuddy",
+    "packages/sources/codebuddy-ide",
     "packages/sources/zed",
     "packages/sources/opencode",
     "packages/apps/cli",
@@ -19,10 +20,13 @@ aa_session_core = { path = "packages/core" }
 aa_session_source_opencode = { path = "packages/sources/opencode" }
 aa_session_source_claude = { path = "packages/sources/claude" }
 aa_session_source_codebuddy = { path = "packages/sources/codebuddy" }
+aa_session_source_codebuddy_ide = { path = "packages/sources/codebuddy-ide" }
 aa_session_source_zed = { path = "packages/sources/zed" }
 
 anyhow = "1"
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+md-5 = "0.10"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

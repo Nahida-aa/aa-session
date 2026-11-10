@@ -13,6 +13,7 @@ aa_session_core = { workspace = true }
 aa_session_source_opencode = { workspace = true }
 aa_session_source_claude = { workspace = true }
 aa_session_source_codebuddy = { workspace = true }
+aa_session_source_codebuddy_ide = { workspace = true }
 aa_session_source_zed = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
